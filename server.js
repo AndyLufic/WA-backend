@@ -2,252 +2,281 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import mongoose from 'mongoose';
-import bcrypt from 'bcryptjs';            // <-- use bcryptjs
+import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 
-import User from './models/User.js';
-import Location from './models/Location.js';
-import Scooter from './models/Scooter.js';
-
+/* ==========================
+   1) Setup & DB connection
+   ========================== */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/scooter_rental';
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || 'devsecret';
-const MONGO_URI = process.env.MONGO_URI;
 
-// ----------------- DB -----------------
-await mongoose
-  .connect(MONGO_URI, { dbName: 'scooterapp' })
+mongoose.set('strictQuery', true);
+mongoose
+  .connect(MONGO_URI)
   .then(() => console.log('✅ MongoDB connected'))
   .catch((err) => {
-    console.error('MongoDB error:', err);
+    console.error('❌ MongoDB connection error', err);
     process.exit(1);
   });
 
-// ---- Seed demo users (provider & customer) if none exist ----
-if ((await User.countDocuments()) === 0) {
-  const [provHash, custHash] = await Promise.all([
-    bcrypt.hash('provider123', 10),
-    bcrypt.hash('customer123', 10),
-  ]);
-  await User.create([
-    { email: 'provider@demo.com', passwordHash: provHash, role: 'provider' },
-    { email: 'customer@demo.com', passwordHash: custHash, role: 'customer' },
-  ]);
-  console.log('👤 Seeded users: provider@demo.com / provider123 & customer@demo.com / customer123');
+/* ==========================
+   2) Schemas & Models
+   ========================== */
+const userSchema = new mongoose.Schema(
+  {
+    email: { type: String, unique: true, required: true, lowercase: true, trim: true },
+    passwordHash: { type: String, required: true },
+    role: { type: String, enum: ['customer', 'provider'], required: true },
+    alias: { type: String, trim: true, default: '' }, // << NEW
+  },
+  { timestamps: true }
+);
+
+const locationSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    city: { type: String, required: true, trim: true },
+    lat: { type: Number, required: true },
+    lng: { type: Number, required: true },
+  },
+  { timestamps: true }
+);
+
+const scooterSchema = new mongoose.Schema(
+  {
+    model: { type: String, required: true, trim: true },
+    battery: { type: Number, default: 100, min: 0, max: 100 },
+    status: {
+      type: String,
+      enum: ['available', 'reserved', 'in_use', 'maintenance', 'offline'],
+      default: 'available',
+    },
+    location: { type: mongoose.Schema.Types.ObjectId, ref: 'Location', required: true },
+  },
+  { timestamps: true }
+);
+
+const User = mongoose.model('User', userSchema);
+const Location = mongoose.model('Location', locationSchema);
+const Scooter = mongoose.model('Scooter', scooterSchema);
+
+/* ==========================
+   3) Auth helpers & middleware
+   ========================== */
+function sign(user) {
+  return jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
 }
 
-// ---- Seed demo LOCATIONS + SCOOTERS if DB is empty ----
-async function seedIfEmpty() {
-  const locCount = await Location.countDocuments();
-  if (locCount > 0) return;
-
-  const locations = await Location.create([
-    { name: 'Pula Center',  city: 'Pula', lat: 44.8666, lng: 13.8496 },
-    { name: 'Pula Harbor',  city: 'Pula', lat: 44.8700, lng: 13.8530 },
-    { name: 'Veruda Park',  city: 'Pula', lat: 44.8522, lng: 13.8445 },
-  ]);
-
-  const [center, harbor, veruda] = locations;
-
-  await Scooter.create([
-    { model: 'Xiaomi M365', battery: 92, status: 'available',   location: center._id },
-    { model: 'Ninebot ES2', battery: 75, status: 'maintenance', location: center._id },
-    { model: 'Bird Flex',   battery: 88, status: 'available',   location: harbor._id },
-    { model: 'Lime Gen4',   battery: 63, status: 'reserved',    location: veruda._id },
-  ]);
-
-  console.log('🌱 Seeded demo locations & scooters');
-}
-await seedIfEmpty();
-
-// ----------------- Auth helpers -----------------
-function signToken(user) {
-  return jwt.sign(
-    { id: user._id, email: user.email, role: user.role },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
+function authRequired(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
 }
 
-// If a route needs a logged-in user, call auth().
-// If it needs a specific role, call auth('provider').
-function auth(requiredRole = null) {
-  return (req, res, next) => {
-    const header = req.headers.authorization || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'No token' });
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (requiredRole && decoded.role !== requiredRole) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      req.user = decoded;
-      next();
-    } catch {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-  };
+function providerOnly(req, res, next) {
+  if (req.user?.role !== 'provider') {
+    return res.status(403).json({ error: 'Provider role required' });
+  }
+  next();
 }
 
-// ----------------- AUTH -----------------
+/* ==========================
+   4) Auth routes (signup, login, me)
+   ========================== */
+
+// POST /api/auth/signup
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, password, role } = req.body || {};
-    if (!email || !password || !['customer', 'provider'].includes(role)) {
-      return res.status(400).json({ error: 'email, password, role required' });
+    const { email, password, role, alias = '' } = req.body || {};
+    if (!email || !password || !role) return res.status(400).json({ error: 'Missing fields' });
+    if (!['customer', 'provider'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
     }
-    const exists = await User.findOne({ email });
-    if (exists) return res.status(409).json({ error: 'Email already in use' });
+    const exists = await User.findOne({ email: email.toLowerCase() });
+    if (exists) return res.status(400).json({ error: 'Email already in use' });
 
-    const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({ email, passwordHash, role });
-    const token = signToken(user);
-    res.status(201).json({ token, user: { id: user._id, email: user.email, role: user.role } });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    const u = await User.create({ email, passwordHash, role, alias });
+
+    const token = sign(u);
+    res.status(201).json({
+      token,
+      user: { id: u._id, email: u.email, role: u.role, alias: u.alias },
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Signup failed' });
   }
 });
 
+// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    const user = await User.findOne({ email });
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = signToken(user);
-    res.json({ token, user: { id: user._id, email: user.email, role: user.role } });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+
+    const u = await User.findOne({ email: email.toLowerCase() });
+    if (!u) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const ok = await bcrypt.compare(String(password), u.passwordHash);
+    if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
+
+    const token = sign(u);
+    res.json({
+      token,
+      user: { id: u._id, email: u.email, role: u.role, alias: u.alias },
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Login failed' });
   }
 });
 
-app.get('/api/auth/me', auth(), async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id).lean();
-    if (!user) return res.status(404).json({ error: 'Not found' });
-    res.json({ id: user._id, email: user.email, role: user.role });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// GET /api/auth/me
+app.get('/api/auth/me', authRequired, async (req, res) => {
+  const u = await User.findById(req.user.id).select('_id email role alias');
+  if (!u) return res.status(404).json({ error: 'Not found' });
+  res.json({ id: u._id, email: u.email, role: u.role, alias: u.alias });
 });
 
-// ----------------- LOCATIONS -----------------
-app.get('/api/locations', async (_req, res) => {
-  try {
-    const locations = await Location.find().lean();
-    res.json(locations);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+/* ==========================
+   5) Profile routes (alias, password)
+   ========================== */
+
+// PUT /api/users/me  (update alias)
+app.put('/api/users/me', authRequired, async (req, res) => {
+  const { alias = '' } = req.body || {};
+  const u = await User.findByIdAndUpdate(
+    req.user.id,
+    { alias: String(alias).trim().slice(0, 40) },
+    { new: true }
+  ).select('_id email role alias');
+  res.json({ id: u._id, email: u.email, role: u.role, alias: u.alias });
 });
 
-app.get('/api/locations/:id', async (req, res) => {
-  try {
-    const location = await Location.findById(req.params.id).lean();
-    if (!location) return res.status(404).json({ error: 'Location not found' });
-    const scooters = await Scooter.find({ location: location._id }).lean();
-    res.json({ ...location, scooters });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+// PUT /api/users/me/password  (change password)
+app.put('/api/users/me/password', authRequired, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'Missing fields' });
   }
+  const u = await User.findById(req.user.id);
+  if (!u) return res.status(404).json({ error: 'Not found' });
+
+  const ok = await bcrypt.compare(String(currentPassword), u.passwordHash);
+  if (!ok) return res.status(400).json({ error: 'Current password incorrect' });
+
+  u.passwordHash = await bcrypt.hash(String(newPassword), 10);
+  await u.save();
+  res.json({ success: true });
 });
 
-app.post('/api/locations', auth('provider'), async (req, res) => {
-  try {
-    const { name, city, lat, lng } = req.body || {};
-    if (!name || !city || typeof lat !== 'number' || typeof lng !== 'number') {
-      return res.status(400).json({ error: 'name, city, lat, lng required' });
-    }
-    const loc = await Location.create({ name, city, lat, lng });
-    res.status(201).json(loc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+/* ==========================
+   6) Locations (provider-only for write)
+   ========================== */
+
+// GET /api/locations
+app.get('/api/locations', async (req, res) => {
+  const items = await Location.find().sort({ createdAt: -1 });
+  res.json(items);
 });
 
-app.patch('/api/locations/:id', auth('provider'), async (req, res) => {
-  try {
-    const loc = await Location.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    if (!loc) return res.status(404).json({ error: 'Not found' });
-    res.json(loc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+// POST /api/locations
+app.post('/api/locations', authRequired, providerOnly, async (req, res) => {
+  const { name, city, lat, lng } = req.body || {};
+  if (!name || !city || typeof lat !== 'number' || typeof lng !== 'number') {
+    return res.status(400).json({ error: 'Invalid input' });
   }
+  const loc = await Location.create({ name, city, lat, lng });
+  res.status(201).json(loc);
 });
 
-app.delete('/api/locations/:id', auth('provider'), async (req, res) => {
-  try {
-    await Scooter.deleteMany({ location: req.params.id }); // cascade delete scooters
-    const result = await Location.findByIdAndDelete(req.params.id);
-    if (!result) return res.status(404).json({ error: 'Not found' });
-    res.status(204).send();
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+// PATCH /api/locations/:id
+app.patch('/api/locations/:id', authRequired, providerOnly, async (req, res) => {
+  const { name, city, lat, lng } = req.body || {};
+  const patch = {};
+  if (name !== undefined) patch.name = name;
+  if (city !== undefined) patch.city = city;
+  if (lat !== undefined) patch.lat = Number(lat);
+  if (lng !== undefined) patch.lng = Number(lng);
+
+  const loc = await Location.findByIdAndUpdate(req.params.id, patch, { new: true });
+  if (!loc) return res.status(404).json({ error: 'Not found' });
+  res.json(loc);
 });
 
-// ----------------- SCOOTERS -----------------
-// Filterable: /api/scooters?location=<id>&status=<status>
+// DELETE /api/locations/:id  (cascade delete scooters)
+app.delete('/api/locations/:id', authRequired, providerOnly, async (req, res) => {
+  const loc = await Location.findByIdAndDelete(req.params.id);
+  if (!loc) return res.status(404).json({ error: 'Not found' });
+  await Scooter.deleteMany({ location: loc._id });
+  res.status(204).send();
+});
+
+/* ==========================
+   7) Scooters (public read, provider write)
+   ========================== */
+
+// GET /api/scooters  (optional ?location=<id>)
 app.get('/api/scooters', async (req, res) => {
-  try {
-    const where = {};
-    if (req.query.location) where.location = req.query.location;
-    if (req.query.status) where.status = req.query.status;
-
-    const scooters = await Scooter.find(where).populate('location').lean();
-    res.json(scooters);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const { location } = req.query;
+  const q = location ? { location } : {};
+  const items = await Scooter.find(q).populate('location').sort({ createdAt: -1 });
+  res.json(items);
 });
 
-app.get('/api/scooters/:id', async (req, res) => {
-  try {
-    const s = await Scooter.findById(req.params.id).populate('location').lean();
-    if (!s) return res.status(404).json({ error: 'Not found' });
-    res.json(s);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// POST /api/scooters
+app.post('/api/scooters', authRequired, providerOnly, async (req, res) => {
+  const { model, battery = 100, status = 'available', location } = req.body || {};
+  if (!model || !location) return res.status(400).json({ error: 'Missing fields' });
+  const locExists = await Location.findById(location);
+  if (!locExists) return res.status(400).json({ error: 'Invalid location' });
+
+  const sc = await Scooter.create({
+    model,
+    battery: Number(battery),
+    status,
+    location,
+  });
+  const populated = await sc.populate('location');
+  res.status(201).json(populated);
 });
 
-app.post('/api/scooters', auth('provider'), async (req, res) => {
-  try {
-    const { model, battery = 100, status = 'available', location } = req.body || {};
-    if (!location) return res.status(400).json({ error: 'Location is required' });
-    const exists = await Location.findById(location);
-    if (!exists) return res.status(400).json({ error: 'Invalid location' });
-
-    const scooter = await Scooter.create({ model, battery, status, location });
-    res.status(201).json(scooter);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+// PATCH /api/scooters/:id
+app.patch('/api/scooters/:id', authRequired, providerOnly, async (req, res) => {
+  const { model, battery, status, location } = req.body || {};
+  const patch = {};
+  if (model !== undefined) patch.model = model;
+  if (battery !== undefined) patch.battery = Number(battery);
+  if (status !== undefined) patch.status = status;
+  if (location !== undefined) {
+    const locExists = await Location.findById(location);
+    if (!locExists) return res.status(400).json({ error: 'Invalid location' });
+    patch.location = location;
   }
+  const sc = await Scooter.findByIdAndUpdate(req.params.id, patch, { new: true }).populate('location');
+  if (!sc) return res.status(404).json({ error: 'Not found' });
+  res.json(sc);
 });
 
-app.patch('/api/scooters/:id', auth('provider'), async (req, res) => {
-  try {
-    const s = await Scooter.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    if (!s) return res.status(404).json({ error: 'Not found' });
-    res.json(s);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+// DELETE /api/scooters/:id
+app.delete('/api/scooters/:id', authRequired, providerOnly, async (req, res) => {
+  const sc = await Scooter.findByIdAndDelete(req.params.id);
+  if (!sc) return res.status(404).json({ error: 'Not found' });
+  res.status(204).send();
 });
 
-app.delete('/api/scooters/:id', auth('provider'), async (req, res) => {
-  try {
-    const s = await Scooter.findByIdAndDelete(req.params.id);
-    if (!s) return res.status(404).json({ error: 'Not found' });
-    res.status(204).send();
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ----------------- Start -----------------
+/* ==========================
+   8) Start server
+   ========================== */
 app.listen(PORT, () => console.log(`🚀 API running at http://localhost:${PORT}`));
