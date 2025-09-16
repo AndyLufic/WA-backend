@@ -329,4 +329,4 @@ if (process.env.DEV_RESET_SECRET) {
 }
 
 //start
-app.listen(PORT, () => console.log(`🚀 API running at https://wa-backend-gw0k.onrender.com:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 API running at http://localhost:${PORT}`));
