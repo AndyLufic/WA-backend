@@ -181,7 +181,7 @@ app.put('/api/users/me/password', authRequired, async (req, res) => {
 
 // GET public
 app.get('/api/locations', async (_req, res) => {
-  const items = await Location.find().sort({ createdAt: -1 }).select('-owner'); // hide owner in public list
+  const items = await Location.find().sort({ createdAt: -1 }).select('-owner'); 
   res.json(items);
 });
 
@@ -329,4 +329,4 @@ if (process.env.DEV_RESET_SECRET) {
 }
 
 //start
-app.listen(PORT, () => console.log(`🚀 API running at http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 API running at https://wa-backend-gw0k.onrender.com:${PORT}`));
